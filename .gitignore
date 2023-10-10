@@ -1,0 +1,5 @@
+**/bin/*
+**/obj/*
+**/nupkg/*
+publish.cmd
+.vscode/
