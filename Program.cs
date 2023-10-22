@@ -42,25 +42,33 @@ namespace Caligo.SqlUpdateScriptGenerator
           Environment.Exit((int)ExitCode.MissingArguments);
           return;
         }
-        GenerateUpdateScript(sourceConnectionString, destinationConnectionString, outputPath);
+        var script = GenerateUpdateScript(sourceConnectionString, destinationConnectionString, outputPath);
+        if (!string.IsNullOrWhiteSpace(script))
+        {
+          string filePath = !string.IsNullOrEmpty(outputPath) ? outputPath : "update.sql";
+
+          Console.WriteLine($"Writing to file: {filePath}");
+          // Write the YAML string to the file
+          File.WriteAllText(filePath, script);
+        }
       });
     }
 
-    private static void GenerateUpdateScript(string sourceConnectionString, string destinationConnectionString, string outputPath)
+    private static string GenerateUpdateScript(string sourceConnectionString, string destinationConnectionString, string outputPath)
     {
       try
       {
         var sourceTables = GetTables(sourceConnectionString);
         var destinationTables = GetTables(destinationConnectionString);
 
-        var script = GenerateSchemaUpdateScript(sourceTables, destinationTables);
-        Console.WriteLine(script);
+        return GenerateSchemaUpdateScript(sourceTables, destinationTables);
       }
       catch (Exception ex)
       {
         Console.WriteLine($"An error occurred: {ex.Message}");
         Console.WriteLine(ex.StackTrace);
         Environment.Exit((int)ExitCode.SqlConnectionError);
+        return null;
       }
     }
 
@@ -128,10 +136,7 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
       foreach (var fk in foreignKeys)
       {
         var table = tables[fk.TABLE_NAME];
-        if (table.ForeignKeys.ContainsKey(fk.COLUMN_NAME)) {
-          continue;
-        }
-        table.ForeignKeys.Add(fk.COLUMN_NAME, fk);
+        table.ForeignKeys.Add(fk.FK_NAME, fk);
       }
 
       return tables;
@@ -191,6 +196,11 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
       HashSet<string> columnsToDelete = new HashSet<string>(sourceColumnNames.Except(destinationColumnNames));
       HashSet<string> columnsToModify = new HashSet<string>(sourceColumnNames.Intersect(destinationColumnNames));
 
+      if (columnsToAdd.Count > 0 || columnsToDelete.Count > 0 || columnsToModify.Count > 0) {
+        scriptBuilder.AppendLine($"-- Update {destinationTable.Name} table");
+        scriptBuilder.AppendLine();
+      }
+
       // Generate SQL for adding columns
       foreach (string columnToAdd in columnsToAdd)
       {
@@ -216,6 +226,12 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
       {
         GenerateDeleteColumnScript(destinationTable.Name, columnToDelete, scriptBuilder);
       }
+      if (columnsToAdd.Count > 0 || columnsToDelete.Count > 0 || columnsToModify.Count > 0) { 
+        scriptBuilder.AppendLine($"-- End Update {destinationTable.Name} table");
+        scriptBuilder.AppendLine();
+        scriptBuilder.AppendLine();
+      }
+
     }
 
     private static void GenerateAddColumnScript(string tableName, TableColumn column, StringBuilder scriptBuilder)

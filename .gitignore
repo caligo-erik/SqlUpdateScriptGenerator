@@ -2,4 +2,5 @@
 **/obj/*
 **/nupkg/*
 publish.cmd
+update.sql
 .vscode/
