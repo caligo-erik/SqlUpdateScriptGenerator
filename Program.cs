@@ -79,12 +79,15 @@ namespace Caligo.SqlUpdateScriptGenerator
       connection.Open();
       var schemaCheck = !string.IsNullOrWhiteSpace(schemaName) ? $"and t.TABLE_SCHEMA = '{schemaName}' " : string.Empty;
 
-      var FKQuery = $@"SELECT  obj.name AS FK_NAME,
+      var FKQuery = $@"SELECT  
+    obj.name AS FK_NAME,
     sch.name AS [SCHEMA_NAME],
     tab1.name AS [TABLE_NAME],
     col1.name AS [COLUMN_NAME],
     tab2.name AS [REFERENCED_TABLE_NAME],
-    col2.name AS [REFERENCED_COLUMN_NAME]
+    col2.name AS [REFERENCED_COLUMN_NAME],
+    rc.UPDATE_RULE AS UPDATE_CASCADE_ACTION,
+    rc.DELETE_RULE AS DELETE_CASCADE_ACTION
 FROM sys.foreign_key_columns fkc
 INNER JOIN sys.objects obj
     ON obj.object_id = fkc.constraint_object_id
@@ -98,7 +101,9 @@ INNER JOIN sys.tables tab2
     ON tab2.object_id = fkc.referenced_object_id
 INNER JOIN sys.columns col2
     ON col2.column_id = referenced_column_id AND col2.object_id = tab2.object_id
-WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
+INNER JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+    ON rc.CONSTRAINT_NAME = obj.name
+WHERE tab1.type_desc = 'USER_TABLE'" + schemaCheck;
 
       var columns = connection.Query<TableColumn>(@"SELECT t.TABLE_NAME, t.TABLE_SCHEMA, c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE FROM INFORMATION_SCHEMA.TABLES t 
 	inner join INFORMATION_SCHEMA.COLUMNS c on t.TABLE_NAME = c.TABLE_NAME
@@ -126,6 +131,8 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
                 FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE k inner join INFORMATION_SCHEMA.TABLES t on k.TABLE_NAME = t.TABLE_NAME
                 WHERE t.TABLE_TYPE = 'BASE TABLE' " + schemaCheck + @" AND OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + CONSTRAINT_NAME), 'IsPrimaryKey') = 1;");
 
+
+
       foreach (var key in primaryKeys)
       {
         var table = tables[key.TABLE_NAME];
@@ -137,6 +144,33 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
       {
         var table = tables[fk.TABLE_NAME];
         table.ForeignKeys.Add(fk.FK_NAME, fk);
+      }
+
+            schemaCheck = !string.IsNullOrWhiteSpace(schemaName) ? $"AND SCHEMA_NAME(t.schema_id) = '{schemaName}' ": string.Empty;
+
+      var columnIndices = connection.Query<ColumnIndex>(@$"SELECT
+    SCHEMA_NAME(t.schema_id) AS TABLE_SCHEMA,
+    OBJECT_NAME(ix.object_id) AS TABLE_NAME,
+    ix.name AS INDEX_NAME,
+    c.name AS COLUMN_NAME,
+    CASE WHEN ix.is_unique = 1 THEN 1 ELSE 0 END AS IS_UNIQUE,
+    CASE WHEN ix.type_desc = 'NONCLUSTERED' THEN 1 ELSE 0 END AS IS_NONCLUSTERED
+FROM sys.indexes AS ix
+INNER JOIN sys.index_columns AS ic
+    ON ix.object_id = ic.object_id AND ix.index_id = ic.index_id
+INNER JOIN sys.columns AS c
+    ON ix.object_id = c.object_id AND ic.column_id = c.column_id
+INNER JOIN sys.tables AS t
+    ON ix.object_id = t.object_id
+WHERE ix.is_primary_key = 0 -- Exclude primary keys
+    AND (ix.is_unique = 1 OR ix.type_desc = 'NONCLUSTERED') -- Include unique or non-clustered indexes
+    AND t.is_ms_shipped = 0; -- Exclude system tables
+"+ schemaCheck);
+
+      foreach (var index in columnIndices)
+      {
+        var table = tables[index.TABLE_NAME];
+        table.Indices.Add(GetColumnIndexId(index), index);
       }
 
       return tables;
@@ -158,6 +192,7 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
           GenerateColumnUpdates(sourceTable, destinationTable, scriptBuilder);
           GeneratePrimaryKeyUpdates(sourceTable, destinationTable, scriptBuilder);
           GenerateForeignKeyUpdates(sourceTable, destinationTable, scriptBuilder);
+          GenerateIndexUpdates(sourceTable, destinationTable, scriptBuilder);
         }
         else
         {
@@ -185,6 +220,8 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
       return scriptBuilder.ToString();
     }
 
+    
+
     private static void GenerateColumnUpdates(Table sourceTable, Table destinationTable, StringBuilder scriptBuilder)
     {
       // Get the column names from source and destination tables
@@ -196,16 +233,19 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
       HashSet<string> columnsToDelete = new HashSet<string>(sourceColumnNames.Except(destinationColumnNames));
       HashSet<string> columnsToModify = new HashSet<string>(sourceColumnNames.Intersect(destinationColumnNames));
 
-      if (columnsToAdd.Count > 0 || columnsToDelete.Count > 0 || columnsToModify.Count > 0) {
-        scriptBuilder.AppendLine($"-- Update {destinationTable.Name} table");
-        scriptBuilder.AppendLine();
-      }
-
-      // Generate SQL for adding columns
-      foreach (string columnToAdd in columnsToAdd)
+      if (columnsToAdd.Count > 0)
       {
-        TableColumn column = destinationTable.Columns[columnToAdd];
-        GenerateAddColumnScript(destinationTable.Name, column, scriptBuilder);
+        scriptBuilder.AppendLine($"-- Add columns to {destinationTable.Name}");
+        scriptBuilder.AppendLine($"ALTER TABLE [{destinationTable.Name}]");
+        var columnsToAddList = columnsToAdd.ToList();
+        for (int i = 0; i < columnsToAddList.Count; i++)
+        {
+          // Generate SQL for adding columns
+          string columnToAdd = columnsToAddList[i];
+          TableColumn column = destinationTable.Columns[columnToAdd];
+          GenerateAddColumnScript(column, scriptBuilder, columnsToAddList.IsLast(i));
+        }
+        scriptBuilder.AppendLine();
       }
 
       // Generate SQL for modifying columns
@@ -213,6 +253,21 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
       {
         TableColumn sourceColumn = sourceTable.Columns[columnToModify];
         TableColumn destinationColumn = destinationTable.Columns[columnToModify];
+
+        if (ColumnsMatch(sourceColumn, destinationColumn))
+        {
+          scriptBuilder.AppendLine($"-- Skipping {destinationTable.Name} {sourceColumn.COLUMN_NAME} since the column hasn't changed");
+          continue;
+        }
+
+        if (sourceColumn.DATA_TYPE != destinationColumn.DATA_TYPE)
+        {
+          GenerateModifyColumnDataTypeScript(destinationTable.Name, sourceColumn, destinationColumn, scriptBuilder);
+        }
+        else
+        {
+          GenerateModifyColumnScript(destinationTable.Name, sourceColumn, destinationColumn, scriptBuilder);
+        }
 
         // Compare sourceColumn and destinationColumn properties to determine if modification is needed
         // if (/* Check if modification is needed based on properties */)
@@ -222,21 +277,57 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
       }
 
       // Generate SQL for deleting columns
-      foreach (string columnToDelete in columnsToDelete)
+      if (columnsToDelete.Count > 0)
       {
-        GenerateDeleteColumnScript(destinationTable.Name, columnToDelete, scriptBuilder);
+        var columnsToDeleteList = columnsToDelete.ToList();
+        scriptBuilder.AppendLine($"-- ! DROP COLUMNS FROM {destinationTable.Name}");
+        scriptBuilder.AppendLine($"ALTER TABLE [{destinationTable.Name}]");
+        for (int i = 0; i < columnsToDeleteList.Count; i++)
+        {
+          string columnToDelete = columnsToDeleteList[i];
+          scriptBuilder.Append($" DROP COLUMN [{columnToDelete}]");
+          scriptBuilder.AppendLine(columnsToDeleteList.IsLast(i) ? ";" : ",");
+        }
+        scriptBuilder.AppendLine("GO");
       }
-      if (columnsToAdd.Count > 0 || columnsToDelete.Count > 0 || columnsToModify.Count > 0) { 
-        scriptBuilder.AppendLine($"-- End Update {destinationTable.Name} table");
-        scriptBuilder.AppendLine();
-        scriptBuilder.AppendLine();
-      }
-
     }
 
-    private static void GenerateAddColumnScript(string tableName, TableColumn column, StringBuilder scriptBuilder)
+    private static void GenerateModifyColumnDataTypeScript(string? tableName, TableColumn sourceColumn, TableColumn destinationColumn, StringBuilder scriptBuilder)
     {
-      scriptBuilder.AppendLine($"-- ADD COLUMN {column.COLUMN_NAME} TO {tableName}");
+      scriptBuilder.AppendLine($"-- Update table {tableName} alter data type for column {sourceColumn.COLUMN_NAME}");
+      scriptBuilder.AppendLine("-- This will most likely fail, check each statement");
+
+      // create temp column to copy old data
+      string tempColumnName = $"{sourceColumn.COLUMN_NAME}_{System.Guid.NewGuid()}";
+      scriptBuilder.AppendLine($"ALTER TABLE [{tableName}] ADD COLUMN [{tempColumnName}] {sourceColumn.DATA_TYPE} NULL");
+      scriptBuilder.AppendLine($"UPDATE [{tableName}] SET [{tempColumnName}] = [{sourceColumn.COLUMN_NAME}];");
+      scriptBuilder.AppendLine($"ALTER TABLE [{tableName}] DROP COLUMN [{sourceColumn.COLUMN_NAME}];");
+      scriptBuilder.AppendLine($"ALTER TABLE [{tableName}] ADD COLUMN [{sourceColumn.COLUMN_NAME}] {destinationColumn.DATA_TYPE} NULL");
+
+      // special case from bool to datetime
+      if (sourceColumn.DATA_TYPE == "bit" && destinationColumn.DATA_TYPE == "datetime")
+      {
+        scriptBuilder.AppendLine($"UPDATE [{tableName}] SET [{sourceColumn.COLUMN_NAME}] = CASE WHEN [{tempColumnName}] = 1 THEN GETDATE() ELSE NULL END;");
+      }
+      else
+      {
+        scriptBuilder.AppendLine($"UPDATE [{tableName}] SET [{sourceColumn.COLUMN_NAME}] = CAST([{tempColumnName}] AS {destinationColumn.DATA_TYPE});");
+      }
+      scriptBuilder.AppendLine();
+    }
+
+    private static bool ColumnsMatch(TableColumn sourceColumn, TableColumn destinationColumn)
+    {
+      return
+        sourceColumn.CHARACTER_MAXIMUM_LENGTH == destinationColumn.CHARACTER_MAXIMUM_LENGTH &&
+        sourceColumn.DATA_TYPE == destinationColumn.DATA_TYPE &&
+        sourceColumn.IS_NULLABLE == destinationColumn.IS_NULLABLE &&
+        sourceColumn.NUMERIC_PRECISION == destinationColumn.NUMERIC_PRECISION &&
+        sourceColumn.NUMERIC_SCALE == destinationColumn.NUMERIC_SCALE;
+    }
+
+    private static void GenerateAddColumnScript(TableColumn column, StringBuilder scriptBuilder, bool isLast)
+    {
       string columnName = column.COLUMN_NAME;
       string dataType = column.DATA_TYPE;
       int? characterMaxLength = column.CHARACTER_MAXIMUM_LENGTH;
@@ -245,7 +336,7 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
       bool isNullable = column.IS_NULLABLE?.ToLower() == "yes";
 
       // Start building the ADD COLUMN script
-      scriptBuilder.Append($"ALTER TABLE {tableName} ADD {columnName} {dataType}");
+      scriptBuilder.Append($" ADD [{columnName}] {dataType}");
 
       // Handle data type-specific considerations
       switch (dataType.ToLower())
@@ -292,8 +383,7 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
       scriptBuilder.Append(isNullable ? " NULL" : " NOT NULL");
 
       // Complete the script with a semicolon
-      scriptBuilder.AppendLine(";");
-      scriptBuilder.AppendLine("GO");
+      scriptBuilder.AppendLine(isLast ? ";" : ",");
     }
 
 
@@ -304,41 +394,159 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
 
     private static void GenerateModifyColumnScript(string tableName, TableColumn sourceColumn, TableColumn destinationColumn, StringBuilder scriptBuilder)
     {
-      // Generate SQL script for modifying a column in the table
-      // Example: ALTER TABLE tableName ALTER COLUMN COLUMN_NAME NEW_DATATYPE;
-      // Append the SQL script to the StringBuilder
-    }
-
-    private static void GenerateDeleteColumnScript(string tableName, string columnName, StringBuilder scriptBuilder)
-    {
-      // Generate SQL script for deleting a column from the table
-      // Example: ALTER TABLE tableName DROP COLUMN COLUMN_NAME;
-      // Append the SQL script to the StringBuilder
+      if (sourceColumn.NUMERIC_PRECISION != destinationColumn.NUMERIC_PRECISION || sourceColumn.NUMERIC_SCALE != destinationColumn.NUMERIC_SCALE)
+      {
+        scriptBuilder.Append($"ALTER TABLE [{tableName}] ALTER COLUMN [{sourceColumn.COLUMN_NAME}] NUMERIC({destinationColumn.NUMERIC_PRECISION}, {destinationColumn.NUMERIC_SCALE})");
+        scriptBuilder.AppendLine(";");
+        scriptBuilder.AppendLine("GO");
+        scriptBuilder.AppendLine();
+      }
+      if (sourceColumn.CHARACTER_MAXIMUM_LENGTH != destinationColumn.CHARACTER_MAXIMUM_LENGTH)
+      {
+        scriptBuilder.Append($"ALTER TABLE [{tableName}] ALTER COLUMN [{sourceColumn.COLUMN_NAME}] {destinationColumn.DATA_TYPE}({destinationColumn.CHARACTER_MAXIMUM_LENGTH})");
+        scriptBuilder.AppendLine(";");
+        scriptBuilder.AppendLine("GO");
+        scriptBuilder.AppendLine();
+      }
+      if (sourceColumn.IS_NULLABLE != destinationColumn.IS_NULLABLE)
+      {
+        bool isNullable = destinationColumn.IS_NULLABLE.ToLower() == "yes";
+        scriptBuilder.Append($"ALTER TABLE [{tableName}] ALTER COLUMN [{sourceColumn.COLUMN_NAME}] ");
+        scriptBuilder.Append(isNullable ? " NULL" : " NOT NULL");
+        scriptBuilder.AppendLine(";");
+        scriptBuilder.AppendLine("GO");
+        scriptBuilder.AppendLine();
+      }
     }
 
 
     private static void GeneratePrimaryKeyUpdates(Table sourceTable, Table destinationTable, StringBuilder scriptBuilder)
     {
-      // Compare and generate SQL for primary key updates (e.g., ADD, DROP)
-      // Append the SQL script parts to the StringBuilder
+      HashSet<string> idsToAdd = new HashSet<string>(destinationTable.PrimaryKeys.Except(sourceTable.PrimaryKeys));
+      HashSet<string> idsToDelete = new HashSet<string>(sourceTable.PrimaryKeys.Except(destinationTable.PrimaryKeys));
+
+      if (idsToAdd.Count > 0 || idsToDelete.Count > 0)
+      {
+        scriptBuilder.AppendLine($"-- updating primary keys for table {destinationTable.Name}");
+        scriptBuilder.AppendLine($"ALTER TABLE {destinationTable.Name} DROP CONSTRAINT PK_{destinationTable.Name}");
+        scriptBuilder.AppendLine($"ALTER TABLE {destinationTable.Name} ADD CONSTRAINT PK_{destinationTable.Name} PRIMARY KEY ({string.Join(", ", destinationTable.PrimaryKeys)})");
+        scriptBuilder.AppendLine("GO");
+        scriptBuilder.AppendLine();
+      }
     }
 
     private static void GenerateForeignKeyUpdates(Table sourceTable, Table destinationTable, StringBuilder scriptBuilder)
     {
-      // Compare and generate SQL for foreign key updates (e.g., ADD, DROP)
-      // Append the SQL script parts to the StringBuilder
+      Dictionary<string, ForeignKey> sourceForeignKeys = new Dictionary<string, ForeignKey>();
+      List<ForeignKey> sourceForeignKeyWarnings = new List<ForeignKey>();
+      if (sourceTable != null)
+      {
+        foreach (var sourceForeignKey in sourceTable.ForeignKeys.Values)
+        {
+          string foreignKeyId = GetForeignKeyId(sourceForeignKey);
+          if (sourceForeignKeys.ContainsKey(foreignKeyId))
+          {
+            sourceForeignKeyWarnings.Add(sourceForeignKey);
+            continue;
+          }
+          sourceForeignKeys.Add(foreignKeyId, sourceForeignKey);
+        }
+      }
+
+      Dictionary<string, ForeignKey> destinationForeignKeys = new Dictionary<string, ForeignKey>();
+      List<ForeignKey> destinationForeignKeyWarnings = new List<ForeignKey>();
+      foreach (var destinationForeignKey in destinationTable.ForeignKeys.Values)
+      {
+        string foreignKeyId = GetForeignKeyId(destinationForeignKey);
+        if (destinationForeignKeys.ContainsKey(foreignKeyId))
+        {
+          destinationForeignKeyWarnings.Add(destinationForeignKey);
+          continue;
+        }
+        destinationForeignKeys.Add(foreignKeyId, destinationForeignKey);
+      }
+      foreach (var warningForeignKey in sourceForeignKeyWarnings)
+      {
+        scriptBuilder.AppendLine($"-- WARNING: source table {destinationTable.Name} has multiple foreign keys to {warningForeignKey.REFERENCED_TABLE_NAME}:{warningForeignKey.REFERENCED_COLUMN_NAME}");
+      }
+      foreach (var warningForeignKey in destinationForeignKeyWarnings)
+      {
+        scriptBuilder.AppendLine($"-- WARNING: destination table {destinationTable.Name} has multiple foreign keys to {warningForeignKey.REFERENCED_TABLE_NAME}:{warningForeignKey.REFERENCED_COLUMN_NAME}");
+      }
+
+      HashSet<string> foreignKeysToAdd = new HashSet<string>(destinationForeignKeys.Keys.Except(sourceForeignKeys.Keys));
+      HashSet<string> foreignKeysToDelete = new HashSet<string>(sourceForeignKeys.Keys.Except(destinationForeignKeys.Keys));
+      HashSet<string> foreignKeysToModify = new HashSet<string>(sourceForeignKeys.Keys.Intersect(destinationForeignKeys.Keys));
+
+      foreach (var foreignKeyId in foreignKeysToAdd)
+      {
+        var foreignKey = destinationForeignKeys[foreignKeyId];
+        scriptBuilder.AppendLine($"ALTER TABLE [{foreignKey.TABLE_NAME}] ADD CONSTRAINT [{foreignKey.FK_NAME}] FOREIGN KEY ({foreignKey.COLUMN_NAME}) " +
+          $"REFERENCES [{foreignKey.REFERENCED_TABLE_NAME}]({foreignKey.REFERENCED_COLUMN_NAME}) " +
+          $"ON UPDATE {foreignKey.UPDATE_CASCADE_ACTION} ON DELETE {foreignKey.DELETE_CASCADE_ACTION};");
+
+      }
+      foreach (var foreignKeyId in foreignKeysToDelete)
+      {
+        var foreignKey = sourceForeignKeys[foreignKeyId];
+        scriptBuilder.AppendLine($"ALTER TABLE [{foreignKey.TABLE_NAME}] DROP CONSTRAINT [{foreignKey.FK_NAME}]");
+      }
+      foreach (var foreignKeyId in foreignKeysToModify)
+      {
+        var sourceForeignKey = sourceForeignKeys[foreignKeyId];
+        var destinationForeignKey = destinationForeignKeys[foreignKeyId];
+        if (sourceForeignKey.DELETE_CASCADE_ACTION != destinationForeignKey.DELETE_CASCADE_ACTION
+        || sourceForeignKey.UPDATE_CASCADE_ACTION != destinationForeignKey.UPDATE_CASCADE_ACTION)
+        {
+          scriptBuilder.AppendLine($"ALTER TABLE [{destinationForeignKey.TABLE_NAME}] DROP CONSTRAINT [{sourceForeignKey.FK_NAME}]");
+          scriptBuilder.AppendLine($"ALTER TABLE [{destinationForeignKey.TABLE_NAME}] ADD CONSTRAINT [{destinationForeignKey.FK_NAME}] FOREIGN KEY ({destinationForeignKey.COLUMN_NAME}) " +
+          $"REFERENCES [{destinationForeignKey.REFERENCED_TABLE_NAME}]({destinationForeignKey.REFERENCED_COLUMN_NAME}) " +
+          $"ON UPDATE {destinationForeignKey.UPDATE_CASCADE_ACTION} ON DELETE {destinationForeignKey.DELETE_CASCADE_ACTION};");
+        }
+      }
+    }
+
+    private static void GenerateIndexUpdates(Table sourceTable, Table destinationTable, StringBuilder scriptBuilder)
+    {
+      HashSet<string> foreignKeysToAdd = new HashSet<string>(destinationTable.Indices.Keys.Except(sourceTable.Indices.Keys));
+      HashSet<string> foreignKeysToDelete = new HashSet<string>(sourceTable.Indices.Keys.Except(destinationTable.Indices.Keys));
+      HashSet<string> foreignKeysToModify = new HashSet<string>(sourceTable.Indices.Keys.Intersect(destinationTable.Indices.Keys));
+
+      // TODO Continue here
+    }
+
+    private static string GetForeignKeyId(ForeignKey foreignKey)
+    {
+      return $"{foreignKey.REFERENCED_TABLE_NAME}|{foreignKey.REFERENCED_COLUMN_NAME}";
+    }
+
+    private static string GetColumnIndexId(ColumnIndex columnIndex) {
+      return $"{columnIndex.TABLE_NAME}|{columnIndex.COLUMN_NAME}";
     }
 
     private static void GenerateTableCreation(Table destinationTable, StringBuilder scriptBuilder)
     {
-      // Generate SQL for creating a table
-      // Return a string containing the SQL script parts
+      scriptBuilder.AppendLine($"CREATE TABLE [{destinationTable.Name}]");
+      var columns = destinationTable.Columns.Values.ToList();
+      for (int i = 0; i < columns.Count; i++)
+      {
+        var column = columns[i];
+        GenerateAddColumnScript(column, scriptBuilder, columns.IsLast(i));
+      }
+      scriptBuilder.AppendLine("GO");
+      
+      scriptBuilder.AppendLine($"ALTER TABLE {destinationTable.Name} ADD CONSTRAINT PK_{destinationTable.Name} PRIMARY KEY ({string.Join(", ", destinationTable.PrimaryKeys)})");
+      scriptBuilder.AppendLine("GO");
+      scriptBuilder.AppendLine();
+
     }
 
     private static void GenerateTableDeletion(Table sourceTable, StringBuilder scriptBuilder)
     {
-      // Generate SQL for deleting a table
-      // Return a string containing the SQL script parts
+      scriptBuilder.Append($"-- deleting table table {sourceTable.Name}");
+      scriptBuilder.AppendLine($"DROP TABLE [{sourceTable.Name}]");
+      scriptBuilder.AppendLine("GO");
+      scriptBuilder.AppendLine();
     }
 
   }
@@ -356,10 +564,16 @@ WHERE tab1.type_desc = 'USER_TABLE' " + schemaCheck;
 
     public HashSet<string> PrimaryKeys = new HashSet<string>();
     public Dictionary<string, ForeignKey> ForeignKeys = new Dictionary<string, ForeignKey>();
+
+    public Dictionary<string, ColumnIndex> Indices = new Dictionary<string, ColumnIndex>();
+  }
+
+  internal class ColumnIndex {
+    public string TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, INDEX_NAME, IS_UNIQUE,	IS_NONCLUSTERED;
   }
 
   internal class ForeignKey
   {
-    public string FK_NAME, SCHEMA_NAME, TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME;
+    public string FK_NAME, SCHEMA_NAME, TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, UPDATE_CASCADE_ACTION, DELETE_CASCADE_ACTION;
   }
 }
