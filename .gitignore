@@ -1,5 +1,6 @@
 **/bin/*
 **/obj/*
 **/nupkg/*
-publish.cmd
-update.sql
+**/publish.cmd
+**/update.sql
+**/.vscode/

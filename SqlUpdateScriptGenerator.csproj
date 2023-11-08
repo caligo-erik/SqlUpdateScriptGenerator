@@ -5,12 +5,31 @@
     <TargetFramework>net7.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <PackageId>Caligo.SqlGenerateUpdateScript</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>Erik Norman</Authors>
+    <Company>Caligo s.r.l.</Company>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>SqlGenerateUpdateScript</ToolCommandName>
+    <PackageOutputPath>./nupkg</PackageOutputPath>
+    <PackageLicenseFile>LICENSE.md</PackageLicenseFile>
+    <PackageReleaseNotes>ReleaseNotes.md</PackageReleaseNotes>
+    <PackageTags>MS SQL Server;update;schemas</PackageTags>
+    <Description>This is a command-line tool that extracts schema information from two Microsoft SQL Server databases -- source and destination -- and generates an SQL script to update the schema from source to destination.</Description>
+    <RepositoryUrl>https://github.com/caligo-erik/SqlUpdateScriptGenerator.git</RepositoryUrl>
+    <PackageIcon>icon.png</PackageIcon>
+    <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="CommandLineParser" Version="2.9.1" />
     <PackageReference Include="Dapper" Version="2.1.4" />
     <PackageReference Include="System.Data.SqlClient" Version="4.8.5" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="LICENSE.md" Pack="true" PackagePath="\" />
+    <None Include="images\icon.png" Pack="true" PackagePath="\"/>
   </ItemGroup>
 
 </Project>

@@ -146,13 +146,13 @@ WHERE tab1.type_desc = 'USER_TABLE'" + schemaCheck;
         table.ForeignKeys.Add(fk.FK_NAME, fk);
       }
 
-            schemaCheck = !string.IsNullOrWhiteSpace(schemaName) ? $"AND SCHEMA_NAME(t.schema_id) = '{schemaName}' ": string.Empty;
+      schemaCheck = !string.IsNullOrWhiteSpace(schemaName) ? $"AND SCHEMA_NAME(t.schema_id) = '{schemaName}' " : string.Empty;
 
       var columnIndices = connection.Query<ColumnIndex>(@$"SELECT
     SCHEMA_NAME(t.schema_id) AS TABLE_SCHEMA,
     OBJECT_NAME(ix.object_id) AS TABLE_NAME,
-    ix.name AS INDEX_NAME,
     c.name AS COLUMN_NAME,
+	ix.name AS INDEX_NAME,
     CASE WHEN ix.is_unique = 1 THEN 1 ELSE 0 END AS IS_UNIQUE,
     CASE WHEN ix.type_desc = 'NONCLUSTERED' THEN 1 ELSE 0 END AS IS_NONCLUSTERED
 FROM sys.indexes AS ix
@@ -164,13 +164,21 @@ INNER JOIN sys.tables AS t
     ON ix.object_id = t.object_id
 WHERE ix.is_primary_key = 0 -- Exclude primary keys
     AND (ix.is_unique = 1 OR ix.type_desc = 'NONCLUSTERED') -- Include unique or non-clustered indexes
-    AND t.is_ms_shipped = 0; -- Exclude system tables
-"+ schemaCheck);
+    AND t.is_ms_shipped = 0 -- Exclude system tables
+ORDER by TABLE_NAME, COLUMN_NAME
+" + schemaCheck);
 
       foreach (var index in columnIndices)
       {
         var table = tables[index.TABLE_NAME];
-        table.Indices.Add(GetColumnIndexId(index), index);
+        try
+        {
+          table.Indices.Add(index);
+        }
+        catch (Exception ex)
+        {
+          Console.Write("");
+        }
       }
 
       return tables;
@@ -220,7 +228,7 @@ WHERE ix.is_primary_key = 0 -- Exclude primary keys
       return scriptBuilder.ToString();
     }
 
-    
+
 
     private static void GenerateColumnUpdates(Table sourceTable, Table destinationTable, StringBuilder scriptBuilder)
     {
@@ -256,7 +264,7 @@ WHERE ix.is_primary_key = 0 -- Exclude primary keys
 
         if (ColumnsMatch(sourceColumn, destinationColumn))
         {
-          scriptBuilder.AppendLine($"-- Skipping {destinationTable.Name} {sourceColumn.COLUMN_NAME} since the column hasn't changed");
+          // scriptBuilder.AppendLine($"-- Skipping {destinationTable.Name} {sourceColumn.COLUMN_NAME} since the column hasn't changed");
           continue;
         }
 
@@ -280,6 +288,7 @@ WHERE ix.is_primary_key = 0 -- Exclude primary keys
       if (columnsToDelete.Count > 0)
       {
         var columnsToDeleteList = columnsToDelete.ToList();
+        scriptBuilder.AppendLine();
         scriptBuilder.AppendLine($"-- ! DROP COLUMNS FROM {destinationTable.Name}");
         scriptBuilder.AppendLine($"ALTER TABLE [{destinationTable.Name}]");
         for (int i = 0; i < columnsToDeleteList.Count; i++)
@@ -289,6 +298,7 @@ WHERE ix.is_primary_key = 0 -- Exclude primary keys
           scriptBuilder.AppendLine(columnsToDeleteList.IsLast(i) ? ";" : ",");
         }
         scriptBuilder.AppendLine("GO");
+        scriptBuilder.AppendLine();
       }
     }
 
@@ -496,23 +506,75 @@ WHERE ix.is_primary_key = 0 -- Exclude primary keys
         var sourceForeignKey = sourceForeignKeys[foreignKeyId];
         var destinationForeignKey = destinationForeignKeys[foreignKeyId];
         if (sourceForeignKey.DELETE_CASCADE_ACTION != destinationForeignKey.DELETE_CASCADE_ACTION
-        || sourceForeignKey.UPDATE_CASCADE_ACTION != destinationForeignKey.UPDATE_CASCADE_ACTION)
+         || sourceForeignKey.UPDATE_CASCADE_ACTION != destinationForeignKey.UPDATE_CASCADE_ACTION)
         {
           scriptBuilder.AppendLine($"ALTER TABLE [{destinationForeignKey.TABLE_NAME}] DROP CONSTRAINT [{sourceForeignKey.FK_NAME}]");
           scriptBuilder.AppendLine($"ALTER TABLE [{destinationForeignKey.TABLE_NAME}] ADD CONSTRAINT [{destinationForeignKey.FK_NAME}] FOREIGN KEY ({destinationForeignKey.COLUMN_NAME}) " +
           $"REFERENCES [{destinationForeignKey.REFERENCED_TABLE_NAME}]({destinationForeignKey.REFERENCED_COLUMN_NAME}) " +
           $"ON UPDATE {destinationForeignKey.UPDATE_CASCADE_ACTION} ON DELETE {destinationForeignKey.DELETE_CASCADE_ACTION};");
+          scriptBuilder.AppendLine("GO");
+          scriptBuilder.AppendLine();
         }
       }
     }
 
     private static void GenerateIndexUpdates(Table sourceTable, Table destinationTable, StringBuilder scriptBuilder)
     {
-      HashSet<string> foreignKeysToAdd = new HashSet<string>(destinationTable.Indices.Keys.Except(sourceTable.Indices.Keys));
-      HashSet<string> foreignKeysToDelete = new HashSet<string>(sourceTable.Indices.Keys.Except(destinationTable.Indices.Keys));
-      HashSet<string> foreignKeysToModify = new HashSet<string>(sourceTable.Indices.Keys.Intersect(destinationTable.Indices.Keys));
+      Dictionary<string, ColumnIndex> sourceIndices = new Dictionary<string, ColumnIndex>();
+      List<ColumnIndex> sourceIndexWarnings = new List<ColumnIndex>();
+      if (sourceTable != null)
+      {
+        foreach (var sourceIndex in sourceTable.Indices)
+        {
+          string columnIndexId = GetColumnIndexId(sourceIndex);
+          if (sourceIndices.ContainsKey(columnIndexId))
+          {
+            sourceIndexWarnings.Add(sourceIndex);
+            continue;
+          }
+          else
+          {
+            sourceIndices.Add(columnIndexId, sourceIndex);
+          }
+        }
+      }
+      Dictionary<string, ColumnIndex> destinationIndices = new Dictionary<string, ColumnIndex>();
+      List<ColumnIndex> destinationIndexWarnings = new List<ColumnIndex>();
+      foreach (var destinationIndex in destinationTable.Indices)
+      {
+        string columnIndexId = GetColumnIndexId(destinationIndex);
+        if (destinationIndices.ContainsKey(columnIndexId))
+        {
+          destinationIndexWarnings.Add(destinationIndex);
+          continue;
+        }
+        else
+        {
+          destinationIndices.Add(columnIndexId, destinationIndex);
+        }
+      }
 
-      // TODO Continue here
+      HashSet<string> indicesToAdd = new HashSet<string>(destinationIndices.Keys.Except(sourceIndices.Keys));
+      HashSet<string> indicesToDelete = new HashSet<string>(sourceIndices.Keys.Except(destinationIndices.Keys));
+
+      foreach (var indexName in indicesToAdd)
+      {
+        var index = destinationTable.Indices.FirstOrDefault(x => indexName == GetColumnIndexId(x));
+        string indexType = index.IS_NONCLUSTERED ? "NONCLUSTERED" : "CLUSTERED";
+        string uniqueConstraint = index.IS_UNIQUE ? "UNIQUE" : "";
+
+        scriptBuilder.AppendLine($"CREATE {uniqueConstraint} {indexType} INDEX {index.INDEX_NAME} " +
+         $"ON [{index.TABLE_SCHEMA}].[{index.TABLE_NAME}] ({index.COLUMN_NAME});");
+        scriptBuilder.AppendLine("GO");
+        scriptBuilder.AppendLine();
+      }
+      foreach (var indexName in indicesToDelete)
+      {
+        var index = sourceTable.Indices.FirstOrDefault(x => indexName == GetColumnIndexId(x));
+        scriptBuilder.AppendLine($"DROP INDEX [{index.TABLE_SCHEMA}].[{index.TABLE_NAME}].{index.INDEX_NAME};");
+        scriptBuilder.AppendLine("GO");
+        scriptBuilder.AppendLine();
+      }
     }
 
     private static string GetForeignKeyId(ForeignKey foreignKey)
@@ -520,7 +582,8 @@ WHERE ix.is_primary_key = 0 -- Exclude primary keys
       return $"{foreignKey.REFERENCED_TABLE_NAME}|{foreignKey.REFERENCED_COLUMN_NAME}";
     }
 
-    private static string GetColumnIndexId(ColumnIndex columnIndex) {
+    private static string GetColumnIndexId(ColumnIndex columnIndex)
+    {
       return $"{columnIndex.TABLE_NAME}|{columnIndex.COLUMN_NAME}";
     }
 
@@ -534,17 +597,19 @@ WHERE ix.is_primary_key = 0 -- Exclude primary keys
         GenerateAddColumnScript(column, scriptBuilder, columns.IsLast(i));
       }
       scriptBuilder.AppendLine("GO");
-      
+
       scriptBuilder.AppendLine($"ALTER TABLE {destinationTable.Name} ADD CONSTRAINT PK_{destinationTable.Name} PRIMARY KEY ({string.Join(", ", destinationTable.PrimaryKeys)})");
       scriptBuilder.AppendLine("GO");
       scriptBuilder.AppendLine();
 
+      GenerateForeignKeyUpdates(null, destinationTable, scriptBuilder);
+      GenerateIndexUpdates(null, destinationTable, scriptBuilder);
     }
 
     private static void GenerateTableDeletion(Table sourceTable, StringBuilder scriptBuilder)
     {
-      scriptBuilder.Append($"-- deleting table table {sourceTable.Name}");
-      scriptBuilder.AppendLine($"DROP TABLE [{sourceTable.Name}]");
+      scriptBuilder.AppendLine($"-- deleting table {sourceTable.Name}");
+      scriptBuilder.AppendLine($"DROP TABLE [{sourceTable.Name}];");
       scriptBuilder.AppendLine("GO");
       scriptBuilder.AppendLine();
     }
@@ -565,11 +630,13 @@ WHERE ix.is_primary_key = 0 -- Exclude primary keys
     public HashSet<string> PrimaryKeys = new HashSet<string>();
     public Dictionary<string, ForeignKey> ForeignKeys = new Dictionary<string, ForeignKey>();
 
-    public Dictionary<string, ColumnIndex> Indices = new Dictionary<string, ColumnIndex>();
+    public List<ColumnIndex> Indices = new List<ColumnIndex>();
   }
 
-  internal class ColumnIndex {
-    public string TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, INDEX_NAME, IS_UNIQUE,	IS_NONCLUSTERED;
+  internal class ColumnIndex
+  {
+    public string TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, INDEX_NAME;
+    public bool IS_UNIQUE, IS_NONCLUSTERED;
   }
 
   internal class ForeignKey
